@@ -7,6 +7,9 @@ Commands:
     meet gui             - Launch GUI widget for recording
     meet devices         - List available audio devices
     meet check           - Check system prerequisites
+    meet download        - Download alignment models
+    meet translate       - Translate a session's transcript
+    meet label           - Assign real names to speakers in a session
 """
 
 from __future__ import annotations
@@ -19,6 +22,7 @@ from pathlib import Path
 import click
 
 from meet.capture import DRAIN_SECONDS
+from meet.utils import fmt_elapsed, fmt_size
 
 
 def _drain_countdown(session, seconds: int = DRAIN_SECONDS) -> None:
@@ -36,8 +40,8 @@ def _drain_countdown(session, seconds: int = DRAIN_SECONDS) -> None:
     try:
         for remaining in range(seconds, 0, -1):
             status = session.status()
-            elapsed = _fmt_elapsed(status.elapsed_seconds)
-            size = _fmt_size(status.file_size_bytes)
+            elapsed = fmt_elapsed(status.elapsed_seconds)
+            size = fmt_size(status.file_size_bytes)
             click.echo(
                 f"\r\033[K\033[1;33m⏳ Flushing audio buffer... {remaining}s\033[0m"
                 f"  {elapsed}  {size}",
@@ -46,32 +50,12 @@ def _drain_countdown(session, seconds: int = DRAIN_SECONDS) -> None:
             time.sleep(1)
         # Final line
         status = session.status()
-        elapsed = _fmt_elapsed(status.elapsed_seconds)
-        size = _fmt_size(status.file_size_bytes)
+        elapsed = fmt_elapsed(status.elapsed_seconds)
+        size = fmt_size(status.file_size_bytes)
         click.echo(f"\r\033[K\033[1;32m✔ Buffer flushed\033[0m  {elapsed}  {size}")
     finally:
         # Restore previous SIGINT handler
         signal.signal(signal.SIGINT, prev_handler)
-
-
-def _fmt_elapsed(seconds: float) -> str:
-    """Format seconds as HH:MM:SS."""
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = int(seconds % 60)
-    return f"{h:02d}:{m:02d}:{s:02d}"
-
-
-def _fmt_size(nbytes: int) -> str:
-    """Format bytes as human-readable size."""
-    if nbytes < 1024:
-        return f"{nbytes} B"
-    elif nbytes < 1024 * 1024:
-        return f"{nbytes / 1024:.1f} KB"
-    elif nbytes < 1024 * 1024 * 1024:
-        return f"{nbytes / (1024 * 1024):.1f} MB"
-    else:
-        return f"{nbytes / (1024 * 1024 * 1024):.1f} GB"
 
 
 def _generate_summary(transcript, out_dir, basename, summary_model, files):
@@ -89,7 +73,10 @@ def _generate_summary(transcript, out_dir, basename, summary_model, files):
 
     click.echo(f"Generating meeting summary ({summary_config.model})...")
     try:
-        result = do_summarize(transcript.to_text(), summary_config)
+        result = do_summarize(
+            transcript.to_text(), summary_config,
+            language=transcript.language,
+        )
         path = result.save(out_dir, basename)
         files["summary"] = path
         click.echo(f"  Summary generated in {result.elapsed_seconds:.1f}s")
@@ -105,7 +92,8 @@ def _generate_pdf(transcript, out_dir, basename, summary_result, files):
 
     pdf_path = out_dir / f"{basename}.pdf"
     try:
-        generate_pdf(transcript, pdf_path, summary=summary_result)
+        generate_pdf(transcript, pdf_path, summary=summary_result,
+                     language=getattr(transcript, "language", "en"))
         files["pdf"] = pdf_path
     except Exception as exc:
         click.echo(f"  PDF generation failed: {exc}", err=True)
@@ -127,8 +115,8 @@ def _recording_loop(session) -> None:
         while True:
             status = session.status()
 
-            elapsed = _fmt_elapsed(status.elapsed_seconds)
-            size = _fmt_size(status.file_size_bytes)
+            elapsed = fmt_elapsed(status.elapsed_seconds)
+            size = fmt_size(status.file_size_bytes)
 
             if status.failed and not warned_failed:
                 # Recording failed and could not restart
@@ -230,8 +218,8 @@ def record(output_dir, filename, mic, monitor, virtual_sink):
               help="Compute type: float16, int8 (default: float16)")
 @click.option("--batch-size", "-b", type=int, default=16,
               help="Batch size for transcription (default: 16)")
-@click.option("--language", "-l", type=str, default="en",
-              help="Language code (default: en)")
+@click.option("--language", "-l", type=str, default="auto",
+              help="Language code or 'auto' to detect (default: auto). Examples: en, de, fr, es, tr, fa")
 @click.option("--hf-token", type=str, default=None, envvar="HF_TOKEN",
               help="HuggingFace token for diarization (or set HF_TOKEN env var)")
 @click.option("--min-speakers", type=int, default=None,
@@ -246,13 +234,27 @@ def record(output_dir, filename, mic, monitor, virtual_sink):
               help="Generate AI meeting summary (default: on)")
 @click.option("--summary-model", type=str, default=None,
               help="Ollama model for summary (default: qwen3.5:9b)")
+@click.option("--skip-alignment", is_flag=True, default=False,
+              help="Skip word-level alignment (useful if alignment model is unavailable)")
 def transcribe(audio_file, model, device, compute_type, batch_size,
                language, hf_token, min_speakers, max_speakers, output_dir,
-               no_diarize, summarize, summary_model):
+               no_diarize, summarize, summary_model, skip_alignment):
     """Transcribe a recorded audio file with speaker diarization."""
-    from meet.transcribe import TranscriptionConfig, transcribe as do_transcribe
+    from meet.transcribe import (
+        TranscriptionConfig, transcribe as do_transcribe,
+        AlignmentModelMissing, ensure_gpu_available,
+    )
 
     audio_path = Path(audio_file)
+
+    # If user passed a session directory, find the WAV file inside it.
+    if audio_path.is_dir():
+        wavs = sorted(audio_path.glob("*.wav"))
+        if not wavs:
+            click.echo(f"Error: no .wav file found in {audio_path}", err=True)
+            raise SystemExit(1)
+        audio_path = wavs[0]
+        click.echo(f"  Resolved to: {audio_path}")
 
     config = TranscriptionConfig(
         model=model,
@@ -263,6 +265,7 @@ def transcribe(audio_file, model, device, compute_type, batch_size,
         hf_token=hf_token if not no_diarize else None,
         min_speakers=min_speakers,
         max_speakers=max_speakers,
+        skip_alignment=skip_alignment,
     )
 
     if not no_diarize and not config.hf_token:
@@ -279,7 +282,21 @@ def transcribe(audio_file, model, device, compute_type, batch_size,
     click.echo(f"  Diarize:  {bool(config.hf_token)}")
     click.echo()
 
-    transcript = do_transcribe(audio_path, config)
+    # Free GPU memory from Ollama before transcription
+    ensure_gpu_available()
+
+    try:
+        transcript = do_transcribe(audio_path, config)
+    except AlignmentModelMissing as exc:
+        click.echo()
+        click.echo(click.style(f"Error: {exc}", fg="red"), err=True)
+        click.echo(err=True)
+        click.echo(f"  To download it, run:", err=True)
+        click.echo(f"    meet download {exc.lang}", err=True)
+        click.echo(err=True)
+        click.echo(f"  Or skip alignment (fewer segments, no word-level timestamps):", err=True)
+        click.echo(f"    meet transcribe {audio_file} --language {exc.lang} --skip-alignment", err=True)
+        raise SystemExit(1)
 
     # Determine output directory
     if output_dir is None:
@@ -325,7 +342,7 @@ def transcribe(audio_file, model, device, compute_type, batch_size,
 @click.option("--device", type=click.Choice(["cuda", "cpu"]), default="cuda")
 @click.option("--compute-type", type=str, default="float16")
 @click.option("--batch-size", "-b", type=int, default=16)
-@click.option("--language", "-l", type=str, default="en")
+@click.option("--language", "-l", type=str, default="auto")
 @click.option("--hf-token", type=str, default=None, envvar="HF_TOKEN")
 @click.option("--min-speakers", type=int, default=None)
 @click.option("--max-speakers", type=int, default=None)
@@ -334,12 +351,17 @@ def transcribe(audio_file, model, device, compute_type, batch_size,
               help="Generate AI meeting summary (default: on)")
 @click.option("--summary-model", type=str, default=None,
               help="Ollama model for summary (default: qwen3.5:9b)")
+@click.option("--skip-alignment", is_flag=True, default=False,
+              help="Skip word-level alignment (useful if alignment model is unavailable)")
 def run(output_dir, model, device, compute_type, batch_size,
         language, hf_token, min_speakers, max_speakers, virtual_sink,
-        summarize, summary_model):
+        summarize, summary_model, skip_alignment):
     """Record a meeting, then transcribe when stopped with Ctrl+C."""
     from meet.capture import create_session, check_prerequisites
-    from meet.transcribe import TranscriptionConfig, transcribe as do_transcribe
+    from meet.transcribe import (
+        TranscriptionConfig, transcribe as do_transcribe,
+        AlignmentModelMissing, ensure_gpu_available,
+    )
 
     issues = check_prerequisites()
     if issues:
@@ -362,6 +384,7 @@ def run(output_dir, model, device, compute_type, batch_size,
         hf_token=hf_token,
         min_speakers=min_speakers,
         max_speakers=max_speakers,
+        skip_alignment=skip_alignment,
     )
 
     if not config.hf_token:
@@ -397,7 +420,23 @@ def run(output_dir, model, device, compute_type, batch_size,
         click.echo("Starting transcription...")
         click.echo()
 
-        transcript = do_transcribe(output, config)
+        # Free GPU memory from Ollama before transcription
+        ensure_gpu_available()
+
+        try:
+            transcript = do_transcribe(output, config)
+        except AlignmentModelMissing as exc:
+            click.echo()
+            click.echo(click.style(f"Error: {exc}", fg="red"), err=True)
+            click.echo(err=True)
+            click.echo(f"  To download it, run:", err=True)
+            click.echo(f"    meet download {exc.lang}", err=True)
+            click.echo(err=True)
+            click.echo(f"  Or re-run with --skip-alignment:", err=True)
+            click.echo(f"    meet transcribe {output} --language {exc.lang} --skip-alignment", err=True)
+            click.echo(err=True)
+            click.echo(f"  Your recording is saved at: {output}", err=True)
+            sys.exit(1)
         files = transcript.save(output.parent, basename=output.stem)
 
         # ── Summary + PDF ──
@@ -513,6 +552,327 @@ def check():
 
 
 @main.command()
+@click.argument("languages", nargs=-1)
+@click.option("--all", "download_all", is_flag=True, default=False,
+              help="Download alignment models for all supported languages")
+def download(languages, download_all):
+    """Download alignment models for specified languages.
+
+    \b
+    Examples:
+        meet download de tr fa    # download German, Turkish, Farsi
+        meet download --all       # download all supported models
+    """
+    from meet.transcribe import (
+        get_supported_alignment_languages,
+        download_alignment_model,
+        check_alignment_model_cached,
+    )
+
+    info = get_supported_alignment_languages()
+
+    if download_all:
+        languages = tuple(info.keys())
+    elif not languages:
+        # No arguments — show status of all models
+        click.echo("Alignment model status:")
+        click.echo()
+        click.echo(f"  {'Lang':<6} {'Name':<10} {'Model':<50} {'Size':<10} {'Status'}")
+        click.echo(f"  {'----':<6} {'----':<10} {'-----':<50} {'----':<10} {'------'}")
+        for lang, details in info.items():
+            status = click.style("cached", fg="green") if details["cached"] else click.style("missing", fg="red")
+            click.echo(f"  {lang:<6} {details['name']:<10} {details['model']:<50} {details['size']:<10} {status}")
+        click.echo()
+        click.echo("To download: meet download <lang> [<lang> ...]")
+        click.echo("To download all: meet download --all")
+        return
+
+    # Validate languages
+    invalid = [l for l in languages if l not in info]
+    if invalid:
+        supported = ", ".join(sorted(info.keys()))
+        click.echo(f"Error: unsupported language(s): {', '.join(invalid)}", err=True)
+        click.echo(f"  Supported: {supported}", err=True)
+        raise SystemExit(1)
+
+    # Download each model
+    for lang in languages:
+        details = info[lang]
+        if details["cached"]:
+            click.echo(f"  {details['name']} ({lang}): already cached, skipping.")
+            continue
+        try:
+            download_alignment_model(lang, progress_callback=lambda msg: click.echo(f"  {msg}"))
+        except Exception as exc:
+            click.echo(f"  Error downloading {details['name']} ({lang}): {exc}", err=True)
+
+
+@main.command()
+@click.argument("session_dir", type=click.Path(exists=True))
+@click.option("--to", "target_lang", type=str, default="en",
+              help="Target language for translation (default: en)")
+@click.option("--summary-model", type=str, default=None,
+              help="Ollama model to use (default: qwen3.5:9b)")
+def translate(session_dir, target_lang, summary_model):
+    """Translate a session's transcript to another language.
+
+    \b
+    SESSION_DIR is the path to a meet recording session directory.
+
+    The translated transcript is saved as <basename>.translation.<lang>.txt
+    in the same session directory.
+
+    \b
+    Examples:
+        meet translate ~/meet-recordings/meeting-20260313-231509
+        meet translate ~/meet-recordings/meeting-20260313-231509 --to de
+    """
+    import requests as req
+
+    session_path = Path(session_dir)
+    if not session_path.is_dir():
+        click.echo(f"Error: {session_path} is not a directory", err=True)
+        raise SystemExit(1)
+
+    # Find the .txt transcript file
+    txt_files = sorted(session_path.glob("*.txt"))
+    # Exclude any existing translation files
+    txt_files = [f for f in txt_files if ".translation." not in f.name]
+    if not txt_files:
+        click.echo(f"Error: no .txt transcript found in {session_path}", err=True)
+        raise SystemExit(1)
+
+    txt_file = txt_files[0]
+    transcript_text = txt_file.read_text(encoding="utf-8").strip()
+    if not transcript_text:
+        click.echo(f"Error: transcript file is empty: {txt_file}", err=True)
+        raise SystemExit(1)
+
+    basename = txt_file.stem
+
+    from meet.summarize import OLLAMA_BASE_URL, DEFAULT_MODEL, is_ollama_available
+
+    ollama_url = OLLAMA_BASE_URL
+    model_name = summary_model or DEFAULT_MODEL
+
+    if not is_ollama_available(ollama_url):
+        click.echo("Error: Ollama is not running. Start with: ollama serve", err=True)
+        raise SystemExit(1)
+
+    from meet.languages import LANG_NAMES
+    target_name = LANG_NAMES.get(target_lang, target_lang)
+
+    click.echo(f"Translating: {txt_file}")
+    click.echo(f"  Target language: {target_name}")
+    click.echo(f"  Model: {model_name}")
+    click.echo()
+
+    # Free GPU memory from Ollama models that might be loaded
+    from meet.transcribe import ensure_gpu_available
+    ensure_gpu_available()
+
+    import time as _time
+    t0 = _time.time()
+
+    payload = {
+        "model": model_name,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    f"You are a professional translator. Translate the following "
+                    f"meeting transcript to {target_name}. "
+                    f"Preserve the exact formatting: keep the timestamp markers "
+                    f"like [HH:MM:SS --> HH:MM:SS] and speaker labels (YOU, REMOTE, etc.) "
+                    f"unchanged. Only translate the spoken text. "
+                    f"Be accurate and natural — do not add or remove information."
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"Translate this transcript to {target_name}:\n\n{transcript_text}",
+            },
+        ],
+        "stream": False,
+        "think": False,
+        "options": {
+            "temperature": 0.2,
+            "num_ctx": 8192,
+        },
+    }
+
+    try:
+        resp = req.post(f"{ollama_url}/api/chat", json=payload, timeout=600)
+        resp.raise_for_status()
+    except req.Timeout:
+        click.echo("Error: Ollama timed out. Try a smaller model.", err=True)
+        raise SystemExit(1)
+    except req.HTTPError as e:
+        click.echo(f"Error: Ollama API error: {e}", err=True)
+        raise SystemExit(1)
+
+    elapsed = _time.time() - t0
+    data = resp.json()
+    translated = data.get("message", {}).get("content", "").strip()
+
+    if not translated:
+        click.echo("Error: Ollama returned an empty translation.", err=True)
+        raise SystemExit(1)
+
+    # Save translation
+    out_path = session_path / f"{basename}.translation.{target_lang}.txt"
+    out_path.write_text(translated, encoding="utf-8")
+
+    click.echo(f"Translation complete in {elapsed:.1f}s")
+    click.echo(f"  Saved to: {out_path}")
+    click.echo()
+    click.echo("--- Translation ---")
+    click.echo()
+    click.echo(translated)
+
+
+@main.command()
+@click.argument("session_dir", type=click.Path(exists=True))
+@click.option("--no-audio", is_flag=True, default=False,
+              help="Skip audio playback (just show text samples)")
+@click.option("--no-summary", is_flag=True, default=False,
+              help="Skip Ollama summary regeneration (use find-and-replace on existing summary)")
+def label(session_dir, no_audio, no_summary):
+    """Assign real names to speakers in a transcribed session.
+
+    \b
+    SESSION_DIR is the path to a meet recording session directory.
+
+    For each speaker detected in the transcript, plays a short audio clip
+    (from the appropriate channel) and prompts you to enter a name.
+    Press Enter to keep the current label unchanged.
+
+    After labeling, all outputs (txt, srt, json, summary, pdf) are
+    regenerated with the new speaker names.
+
+    \b
+    Examples:
+        meet label ~/meet-recordings/meeting-20260313-214133
+        meet label ~/meet-recordings/meeting-20260313-214133 --no-audio
+        meet label ~/meet-recordings/meeting-20260313-214133 --no-summary
+    """
+    from meet.label import (
+        get_speakers, extract_speaker_clip, play_clip, apply_labels,
+        _find_session_files,
+    )
+
+    session_path = Path(session_dir)
+    files = _find_session_files(session_path)
+
+    if "json" not in files:
+        click.echo(f"Error: no transcript JSON found in {session_path}", err=True)
+        click.echo("  Run 'meet transcribe' on this session first.", err=True)
+        raise SystemExit(1)
+
+    # Get speaker info
+    try:
+        speakers = get_speakers(session_path)
+    except FileNotFoundError as exc:
+        click.echo(f"Error: {exc}", err=True)
+        raise SystemExit(1)
+
+    if not speakers:
+        click.echo("No speakers found in this session.")
+        return
+
+    if len(speakers) == 1:
+        click.echo(f"Only one speaker found: {speakers[0].id}")
+        click.echo("You can still assign a name if you like.")
+        click.echo()
+
+    click.echo(f"Session: {session_path.name}")
+    click.echo(f"Speakers found: {len(speakers)}")
+    click.echo()
+
+    # Show summary table
+    click.echo(f"  {'#':<4} {'Label':<14} {'Channel':<10} {'Segments':<10} {'Sample Text'}")
+    click.echo(f"  {'─'*4} {'─'*14} {'─'*10} {'─'*10} {'─'*40}")
+    for i, sp in enumerate(speakers, 1):
+        click.echo(f"  {i:<4} {sp.id:<14} {sp.channel:<10} {sp.segment_count:<10} {sp.sample_text[:40]}")
+    click.echo()
+
+    # Find WAV for audio playback
+    wav_path = files.get("wav")
+    can_play = not no_audio and wav_path and wav_path.exists()
+
+    if not can_play and not no_audio:
+        click.echo("  (No WAV file found — skipping audio playback)")
+        click.echo()
+
+    # Interactive labeling loop
+    label_map: dict[str, str] = {}
+    temp_clips: list[Path] = []
+
+    try:
+        for i, sp in enumerate(speakers, 1):
+            click.echo(f"Speaker {i}/{len(speakers)}: {click.style(sp.id, bold=True)}")
+            click.echo(f"  Channel: {sp.channel}  |  Segments: {sp.segment_count}")
+            click.echo(f"  Sample:  \"{sp.sample_text}\"")
+
+            # Play audio clip
+            if can_play:
+                try:
+                    clip_path = extract_speaker_clip(wav_path, sp)
+                    temp_clips.append(clip_path)
+                    click.echo(f"  Playing audio clip... ", nl=False)
+                    proc = play_clip(clip_path)
+                    proc.wait()
+                    click.echo("done")
+                except Exception as exc:
+                    click.echo(f"  (Audio playback failed: {exc})")
+
+            # Prompt for name
+            new_name = click.prompt(
+                f"  Enter name for {sp.id} (Enter to keep)",
+                default="", show_default=False,
+            ).strip()
+
+            if new_name and new_name != sp.id:
+                label_map[sp.id] = new_name
+                click.echo(f"  {sp.id} -> {click.style(new_name, fg='green')}")
+            else:
+                click.echo(f"  Keeping: {sp.id}")
+            click.echo()
+
+    finally:
+        # Clean up temp clips
+        for clip in temp_clips:
+            try:
+                clip.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    if not label_map:
+        click.echo("No labels changed. Nothing to do.")
+        return
+
+    click.echo("Applying labels:")
+    for old, new in label_map.items():
+        click.echo(f"  {old} -> {new}")
+    click.echo()
+
+    # Apply labels and regenerate outputs
+    regenerate_summary = not no_summary
+
+    result_files = apply_labels(
+        session_path,
+        label_map,
+        regenerate_summary=regenerate_summary,
+        progress_callback=lambda msg: click.echo(f"  {msg}"),
+    )
+
+    click.echo()
+    click.echo("Updated files:")
+    for fmt, path in result_files.items():
+        click.echo(f"  {fmt}: {path}")
+
+
+@main.command()
 @click.option("--output-dir", "-o", type=click.Path(), default=None,
               help="Directory for recordings and transcripts")
 @click.option("--model", "-m", type=str, default="large-v3-turbo",
@@ -520,7 +880,7 @@ def check():
 @click.option("--device", type=click.Choice(["cuda", "cpu"]), default="cuda")
 @click.option("--compute-type", type=str, default="float16")
 @click.option("--batch-size", "-b", type=int, default=16)
-@click.option("--language", "-l", type=str, default="en")
+@click.option("--language", "-l", type=str, default="auto")
 @click.option("--hf-token", type=str, default=None, envvar="HF_TOKEN")
 @click.option("--min-speakers", type=int, default=None)
 @click.option("--max-speakers", type=int, default=None)
