@@ -39,12 +39,14 @@ including browser-based meetings and standalone desktop clients.
   participants (right channel) simultaneously via PipeWire/PulseAudio + ffmpeg
 - **WhisperX transcription** -- fast batched inference with
   `openai/whisper-large-v3-turbo`, word-level timestamps via wav2vec2 alignment
+- **Multilingual** -- auto-detects language or manually set it; supports
+  English, German, Turkish, French, Spanish, Farsi, and 90+ other languages
 - **Speaker diarization** -- pyannote-audio identifies who said what, with
   automatic YOU/REMOTE labeling from the dual-channel signal
 - **AI meeting summaries** -- local LLMs via Ollama extract key topics, action
   items, decisions, and follow-ups
 - **Professional PDF output** -- summary + full transcript in a clean,
-  page-numbered PDF
+  page-numbered PDF with full Unicode support (DejaVu Sans) and RTL for Farsi
 - **Multiple output formats** -- `.txt`, `.srt`, `.json`, `.summary.md`, `.pdf`
 - **GTK3 GUI widget** -- small always-on-top window with record/stop, timer,
   and one-click access to results
@@ -56,8 +58,8 @@ including browser-based meetings and standalone desktop clients.
 ## Quick start
 
 ```bash
-# Install
-pip install -e /path/to/meetscribe
+# Install from PyPI
+pip install meetscribe-offline
 
 # Set your HuggingFace token (required for speaker diarization)
 export HF_TOKEN=hf_your_token_here
@@ -93,7 +95,13 @@ sudo dnf install ffmpeg pulseaudio-utils
 ### 2. Install meetscribe
 
 ```bash
-pip install -e /path/to/meetscribe
+# From PyPI (recommended)
+pip install meetscribe-offline
+
+# From source
+git clone https://github.com/pretyflaco/meetscribe
+cd meetscribe
+pip install -e .
 ```
 
 This creates the `meet` command in your PATH.
@@ -158,6 +166,7 @@ meet transcribe ~/meet-recordings/meeting-20260312-140000/meeting-20260312-14000
 
 Options:
 - `-m large-v3-turbo` -- Whisper model (default: `large-v3-turbo`; also: `base`, `medium`, `large-v2`)
+- `-l auto` -- language code or `auto` to auto-detect (default: `auto`; e.g. `en`, `de`, `tr`, `fa`)
 - `--device cuda` -- `cuda` or `cpu` (default: `cuda`)
 - `--compute-type float16` -- `float16` or `int8` for lower VRAM (default: `float16`)
 - `-b 16` -- batch size, reduce if running low on VRAM (default: `16`)
@@ -187,7 +196,28 @@ A small always-on-top window with:
 - Status indicator (Recording, Flushing, Transcribing, Summarizing, Done)
 - "Open PDF" and "Open Folder" buttons after completion
 
+When 2 or more speakers are detected, a **speaker labeling dialog** appears
+before the results are saved. Each speaker is shown with their channel and a
+sample line of text. Enter a real name or leave blank to keep the auto-assigned
+label (YOU, REMOTE_1, etc.).
+
 ![meetscribe GUI](screenshot.png)
+
+### Label speakers after the fact
+
+```bash
+meet label ~/meet-recordings/meeting-20260313-214133
+```
+
+For each speaker in the recording, `meet label`:
+1. Shows a table of all speakers (label, channel, segment count, sample text)
+2. Plays a short audio clip from that speaker's channel (requires `ffplay`)
+3. Prompts you to enter a real name (press Enter to keep the existing label)
+4. Regenerates all outputs (`.txt`, `.srt`, `.json`, `.summary.md`, `.pdf`) with the new names
+
+Options:
+- `--no-audio` -- skip audio playback, just show text samples
+- `--no-summary` -- use find-and-replace instead of re-running Ollama
 
 ## Output
 
@@ -242,6 +272,58 @@ Disable summaries:
 ```bash
 meet run --no-summarize
 ```
+
+## Multilingual support
+
+meetscribe auto-detects the spoken language by default (Whisper large-v3-turbo
+supports 99 languages). You can also set it explicitly:
+
+```bash
+meet run --language de       # German
+meet run --language tr       # Turkish
+meet run --language fr       # French
+meet run --language es       # Spanish
+meet run --language fa       # Farsi (Persian)
+meet run --language auto     # Auto-detect (default)
+```
+
+### How it works
+
+- **Transcription**: The same Whisper model handles all languages -- no extra
+  download or VRAM cost. When set to `auto`, the detected language is used for
+  alignment and all downstream steps.
+- **Speaker diarization**: Completely language-agnostic (based on voice
+  characteristics, not speech content).
+- **AI summary**: When a non-English language is detected, the summary prompt
+  instructs the LLM to write the summary in the same language as the transcript.
+- **PDF output**: Uses DejaVu Sans for full Unicode coverage (Latin, Cyrillic,
+  Greek, Turkish special characters, etc.). Farsi uses Noto Naskh Arabic with
+  RTL text reshaping.
+
+### Tested languages
+
+| Language | Code | Alignment model | PDF font | Notes |
+|----------|------|----------------|----------|-------|
+| English  | `en` | wav2vec2 (torchaudio) | DejaVu Sans | |
+| German   | `de` | VoxPopuli (torchaudio) | DejaVu Sans | |
+| French   | `fr` | VoxPopuli (torchaudio) | DejaVu Sans | |
+| Spanish  | `es` | VoxPopuli (torchaudio) | DejaVu Sans | |
+| Turkish  | `tr` | wav2vec2 (HuggingFace) | DejaVu Sans | ~1.2 GB alignment model download |
+| Farsi    | `fa` | wav2vec2 (HuggingFace) | Noto Naskh Arabic | ~1.2 GB alignment model download, RTL |
+
+### Farsi RTL requirements
+
+Farsi uses right-to-left text. For proper PDF rendering, install the optional
+RTL dependencies:
+
+```bash
+pip install arabic-reshaper python-bidi
+# Or with the optional extra:
+pip install "meetscribe-offline[rtl]"
+```
+
+Without these libraries, Farsi text will appear in the PDF but glyphs may not
+be joined correctly and reading order may be wrong.
 
 ## Virtual sink mode
 
@@ -320,10 +402,24 @@ export LD_LIBRARY_PATH=$HOME/.local/lib/cuda:$LD_LIBRARY_PATH
 ## Limitations
 
 - Overlapping speech is not handled well (Whisper limitation)
-- Speaker labels are role-based (YOU, REMOTE_1, REMOTE_2) not actual names
+- Speaker labels default to role-based (YOU, REMOTE_1, REMOTE_2) — use `meet label` or the GUI dialog to assign real names
 - Diarization accuracy varies with audio quality and number of speakers
-- English only (for now)
 - Linux only (PulseAudio/PipeWire dependency)
+
+## Contributing
+
+```bash
+git clone https://github.com/pretyflaco/meetscribe
+cd meetscribe
+pip install -e .[dev]
+/usr/bin/python3 -m pytest tests/
+```
+
+Pull requests welcome. Please run the test suite before submitting.
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ## License
 
